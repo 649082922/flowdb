@@ -2,6 +2,8 @@
 
 自部署的数据库迁移同步平台：Oracle / MySQL / PostgreSQL 之间做**迁移评估 → 全量迁移 → LogMiner 增量同步 → 数据校验**，全程数据不经过第三方服务。
 
+> 作者：**鸡牛特战队**（[jiniu-squad](https://github.com/jiniu-squad)），由 [小黄（lee43787320）](https://github.com/lee43787320) 主导开发。
+
 ## 核心能力
 
 **迁移前评估**
