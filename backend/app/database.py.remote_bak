@@ -1,0 +1,456 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from decimal import Decimal
+from typing import Any, Iterable
+from urllib.parse import quote_plus
+
+from sqlalchemy import (
+    BigInteger, Boolean, Column, Date, DateTime, Float, Identity, Integer, LargeBinary,
+    MetaData, Numeric, String, Table, Text, create_engine, func, inspect, null, select, text,
+)
+from sqlalchemy.dialects import mysql
+from sqlalchemy.engine import Engine
+from sqlalchemy.sql.sqltypes import BINARY, BLOB, CHAR, CLOB, DECIMAL, DOUBLE, FLOAT, INT, NCHAR, NVARCHAR, REAL, SMALLINT, VARCHAR
+
+from .models import ConnectionConfig
+
+
+def engine_url(config: ConnectionConfig) -> str:
+    user = quote_plus(config.username)
+    password = quote_plus(config.password)
+    host = config.host.strip("[]")
+    if config.type == "oracle":
+        service = quote_plus(config.database)
+        return f"oracle+oracledb://{user}:{password}@{host}:{config.port}/?service_name={service}"
+    database = quote_plus(config.database)
+    if config.type in {"mysql", "tdsql"}:
+        return f"mysql+pymysql://{user}:{password}@{host}:{config.port}/{database}?charset=utf8mb4"
+    return f"postgresql+psycopg://{user}:{password}@{host}:{config.port}/{database}"
+
+
+def make_engine(config: ConnectionConfig) -> Engine:
+    connect_args = {"tcp_connect_timeout": 10} if config.type == "oracle" else {"connect_timeout": 10}
+    return create_engine(engine_url(config), pool_pre_ping=True, pool_recycle=1800, connect_args=connect_args)
+
+
+def default_schema(config: ConnectionConfig) -> str | None:
+    if config.schema_name:
+        return config.schema_name
+    if config.type == "oracle":
+        return config.username.upper()
+    if config.type == "postgresql":
+        return "public"
+    return None
+
+
+def test_engine(engine: Engine) -> tuple[str, str]:
+    with engine.connect() as connection:
+        dialect = engine.dialect.name
+        version = ".".join(str(part) for part in (engine.dialect.server_version_info or ()))
+        connection.execute(text("SELECT 1 FROM DUAL" if dialect == "oracle" else "SELECT 1"))
+    return dialect, version or "unknown"
+
+
+def list_tables(engine: Engine, schema: str | None, owners: list[str] | None = None) -> list[dict[str, Any]]:
+    inspector = inspect(engine)
+    result = []
+    effective_schemas = owners or ([schema] if schema else [None])
+    for effective in effective_schemas:
+        for name in inspector.get_table_names(schema=effective):
+            columns = inspector.get_columns(name, schema=effective)
+            pk = inspector.get_pk_constraint(name, schema=effective).get("constrained_columns") or []
+            result.append({"schema_name": effective, "name": name, "columns": len(columns), "primary_keys": pk})
+    return result
+
+
+def list_objects(engine: Engine, schema: str | None, owners: list[str] | None = None) -> list[dict[str, Any]]:
+    inspector = inspect(engine)
+    result = []
+    effective_schemas = owners or ([schema] if schema else [None])
+    dialect = engine.dialect.name
+    for effective in effective_schemas:
+        for object_type, names in (("table", inspector.get_table_names(schema=effective)), ("view", inspector.get_view_names(schema=effective))):
+            for name in names:
+                columns = inspector.get_columns(name, schema=effective)
+                primary_keys = [] if object_type == "view" else (inspector.get_pk_constraint(name, schema=effective).get("constrained_columns") or [])
+                result.append({"schema_name": effective, "name": name, "columns": len(columns), "primary_keys": primary_keys, "object_type": object_type})
+    if dialect == "oracle":
+        # Oracle sequences：通过 all_sequences 收集（TDSQL 目标支持序列迁移，序列需先于表创建）
+        with engine.connect() as connection:
+            rows = connection.execute(text(
+                "SELECT sequence_owner, sequence_name FROM all_sequences ORDER BY sequence_owner, sequence_name"
+            ))
+        allowed = set(owners or [])
+        for row in rows:
+            owner = str(row[0])
+            if allowed and owner not in allowed:
+                continue
+            if not allowed and schema and owner != schema:
+                continue
+            result.append({"schema_name": owner, "name": str(row[1]), "columns": 0, "primary_keys": [], "object_type": "sequence"})
+    return sorted(result, key=lambda item: (item["object_type"], item["name"].casefold()))
+
+
+def list_owners(engine: Engine, config: ConnectionConfig) -> list[str]:
+    """返回源端可访问的 owner/schema 列表，供前端“筛选 owner”下拉使用。
+
+    Oracle 优先查 all_tables 去重（含当前用户可访问的所有表 owner）；
+    PostgreSQL 返回非系统 schema；MySQL 直接返回连接默认库名。
+    """
+    dialect = engine.dialect.name
+    try:
+        if dialect == "oracle":
+            with engine.connect() as connection:
+                rows = connection.execute(text("SELECT DISTINCT owner FROM all_tables ORDER BY owner"))
+                owners = [str(row[0]) for row in rows if row[0]]
+            return owners
+        if dialect == "postgresql":
+            with engine.connect() as connection:
+                rows = connection.execute(text(
+                    "SELECT nspname FROM pg_namespace WHERE nspname NOT IN ('pg_catalog','information_schema') "
+                    "AND nspname NOT LIKE 'pg_toast%' AND nspname NOT LIKE 'pg_temp%' ORDER BY nspname"
+                ))
+                owners = [str(row[0]) for row in rows if row[0]]
+            return owners
+    except Exception:
+        # MySQL 或元数据视图无权限时，退回连接默认 schema
+        pass
+    fallback = default_schema(config)
+    return [fallback] if fallback else []
+
+
+def portable_type(source_type: Any, target_dialect: str | None = None, identity: bool = False):
+    length = getattr(source_type, "length", None)
+    precision = getattr(source_type, "precision", None)
+    scale = getattr(source_type, "scale", None)
+    name = source_type.__class__.__name__.upper()
+    # SQLAlchemy models Oracle BINARY_FLOAT/BINARY_DOUBLE as numeric types,
+    # so handle them before the generic NUMBER/DECIMAL branch.
+    if name in {"BINARY_FLOAT", "BINARY_DOUBLE"} or isinstance(source_type, (DOUBLE, FLOAT, REAL, Float)):
+        if target_dialect == "mysql":
+            return mysql.DOUBLE(asdecimal=False)
+        return Float()
+    if isinstance(source_type, (DECIMAL, Numeric)) or name in {"NUMBER", "MONEY"}:
+        if identity:
+            return BigInteger()
+        if precision and precision <= 38:
+            return Numeric(precision=precision, scale=scale or 0)
+        if target_dialect == "mysql":
+            # Bare Oracle NUMBER has dynamic precision/scale. MySQL's bare
+            # DECIMAL silently becomes DECIMAL(10,0), so choose its widest
+            # practical exact representation instead of rounding fractions.
+            return mysql.DECIMAL(precision=65, scale=30)
+        return Numeric()
+    if isinstance(source_type, BigInteger) or name == "BIGINT":
+        return BigInteger()
+    if isinstance(source_type, (SMALLINT, INT, Integer)) or name in {"TINYINT", "MEDIUMINT"}:
+        return Integer()
+    if isinstance(source_type, Boolean) or name == "BOOLEAN":
+        return Boolean()
+    if name == "BIT":
+        # BIT(1) is a boolean, BIT(n>1) is a bit vector that must survive as bytes.
+        bit_length = getattr(source_type, "length", None)
+        if bit_length in (None, 1):
+            return Boolean()
+        return LargeBinary(length=(int(bit_length) + 7) // 8)
+    if isinstance(source_type, DateTime) or "TIMESTAMP" in name:
+        timezone = bool(getattr(source_type, "timezone", False))
+        if target_dialect == "mysql":
+            return String(48) if timezone else mysql.DATETIME(fsp=6)
+        return DateTime(timezone=timezone)
+    if isinstance(source_type, Date):
+        return Date()
+    if name in {"RAW", "VARBINARY"}:
+        return LargeBinary(length=length or 2000)
+    if isinstance(source_type, (BLOB, BINARY, LargeBinary)) or name in {"BYTEA", "LONGBLOB", "LONG RAW", "LONG_RAW"}:
+        # LONG RAW 是 Oracle 二进制类型（最大 2GB），映射为二进制列而非字符列，
+        # 否则插入 \x80 等高位字节会报 1366 Incorrect string value。
+        if target_dialect == "mysql" and (name in {"BLOB", "LONGBLOB", "BYTEA", "LONG RAW", "LONG_RAW"} or not length or length > 65535):
+            return mysql.LONGBLOB()
+        return LargeBinary(length=length)
+    if isinstance(source_type, (CLOB, Text)) or name in {"LONGTEXT", "MEDIUMTEXT", "TINYTEXT", "NCLOB", "JSON", "JSONB", "XMLTYPE"}:
+        if target_dialect == "mysql":
+            return mysql.LONGTEXT()
+        return Text()
+    if isinstance(source_type, (CHAR, VARCHAR, NCHAR, NVARCHAR, String)) and length and length <= 10485760:
+        return String(length=min(length, 10485760))
+
+    # --- P1 extension: special / exotic types with explicit degradation ---
+    # XML
+    if name in {"XML", "XMLTYPE"} or "XML" in str(source_type).upper():
+        if target_dialect == "mysql":
+            return mysql.LONGTEXT()
+        return Text()
+
+    # Spatial types (Oracle SDO_GEOMETRY / MySQL GEOMETRY family / PG PostGIS geometry|geography)
+    _geometry_names = {
+        "GEOMETRY", "POINT", "LINESTRING", "POLYGON", "MULTIPOINT",
+        "MULTILINESTRING", "MULTIPOLYGON", "GEOMETRYCOLLECTION",
+        "SDO_GEOMETRY", "GEOGRAPHY",
+    }
+    _type_str_upper = str(source_type).upper()
+    if name in _geometry_names or "SDO_GEOMETRY" in _type_str_upper or "GEOMETRY" in _type_str_upper or "GEOGRAPHY" in _type_str_upper:
+        if target_dialect == "mysql":
+            try:
+                from sqlalchemy.dialects.mysql import GEOMETRY as MySQLGeometry
+
+                return MySQLGeometry()
+            except Exception:
+                return LargeBinary()
+        return Text()
+
+    # MySQL ENUM / SET
+    if name == "ENUM":
+        if target_dialect == "mysql":
+            return source_type
+        enum_length = getattr(source_type, "length", None)
+        if enum_length:
+            return String(length=min(int(enum_length), 10485760))
+        return String(length=255)
+    if name == "SET":
+        if target_dialect == "mysql":
+            return source_type
+        return String(length=1024)
+
+    # PostgreSQL UUID / ARRAY
+    if name == "UUID":
+        if target_dialect == "postgresql":
+            from sqlalchemy import UUID as _SqlUUID
+
+            return _SqlUUID()
+        if target_dialect == "oracle":
+            return CHAR(36)
+        return String(length=36)
+    if name == "ARRAY":
+        return Text()
+
+    # Oracle INTERVAL
+    if name == "INTERVAL":
+        return String(length=48)
+
+    return Text()
+
+
+def portable_type_info(
+    source_type: Any,
+    target_dialect: str | None = None,
+    identity: bool = False,
+) -> dict[str, Any]:
+    """portable_type 的扩展版本：返回目标类型并附降级标记与说明。
+
+    ``target_type`` 与 portable_type 返回的类型完全一致（保持兼容），
+    额外的 ``degraded`` / ``degradation`` 供评估报告标注类型映射风险。
+    """
+    mapped = portable_type(source_type, target_dialect, identity)
+    name = source_type.__class__.__name__.upper()
+    type_str = str(source_type).upper()
+    length = getattr(source_type, "length", None)
+    degraded = False
+    degradation: str | None = None
+
+    if name in {"XML", "XMLTYPE"} or "XML" in type_str:
+        degraded = True
+        degradation = "XML 类型映射为目标端文本类型，XML 结构与查询语义需在应用层处理"
+    elif name in {"GEOMETRY", "SDO_GEOMETRY", "GEOGRAPHY"} or "GEOMETRY" in type_str or "GEOGRAPHY" in type_str:
+        degraded = target_dialect != "mysql"
+        degradation = (
+            "空间类型在 MySQL 端映射为原生几何类型，空间索引需在目标端重建"
+            if target_dialect == "mysql"
+            else "空间类型映射为文本/二进制，空间函数与索引语义需在目标端重建"
+        )
+    elif name == "ENUM":
+        degraded = target_dialect != "mysql"
+        degradation = (
+            "ENUM 在 MySQL 端保留原枚举；其他端映射为字符串，取值集合需应用层校验"
+            if target_dialect == "mysql"
+            else "ENUM 枚举映射为字符串，取值集合需应用层校验"
+        )
+    elif name == "SET":
+        degraded = target_dialect != "mysql"
+        degradation = (
+            "SET 在 MySQL 端保留原集合；其他端映射为字符串，位集合语义需应用层处理"
+            if target_dialect == "mysql"
+            else "SET 映射为字符串，位集合语义需应用层处理"
+        )
+    elif name == "BIT":
+        bit_length = length if length is not None else 1
+        if int(bit_length) <= 1:
+            degraded = False
+            degradation = None
+        else:
+            degraded = True
+            degradation = "多比特 BIT(n) 映射为二进制大字段，按位语义需应用层处理"
+    elif name == "UUID":
+        if target_dialect == "postgresql":
+            degraded = False
+            degradation = None
+        else:
+            degraded = True
+            degradation = "UUID 映射为定长字符串，排序/比较语义与 PG 原生 UUID 基本一致"
+    elif name == "ARRAY":
+        degraded = True
+        degradation = "PG 数组映射为文本（字面量），数组查询/索引语义需在目标端重建"
+    elif name == "INTERVAL":
+        degraded = True
+        degradation = "INTERVAL 映射为文本，目标端无法直接参与日期时间运算"
+    elif name in {"RAW", "VARBINARY"}:
+        degraded = True
+        degradation = "RAW/VARBINARY 映射为二进制类型，注意字节长度上限与字符集无关"
+    elif name in {"NCHAR", "NVARCHAR", "NVARCHAR2"}:
+        degraded = target_dialect != "oracle"
+        degradation = (
+            "NCHAR/NVARCHAR2 映射为普通字符串，需确认目标端字符集可容纳全量字符"
+            if target_dialect != "oracle"
+            else None
+        )
+    return {"target_type": mapped, "degraded": degraded, "degradation": degradation}
+
+
+def _resolve_oracle_column_types(source_engine: Engine, source_schema: str | None, table_name: str, columns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Oracle 方言对 LONG RAW 等类型反射为 NullType，portable_type 会将其降级为
+    Text()，导致高位字节插入目标端报 1366 Incorrect string value。这里用数据字典
+    all_tab_columns 补全真实类型，把 LONG RAW 纠正为二进制类型。"""
+    owner = (source_schema or "").upper()
+    try:
+        with source_engine.connect() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT column_name, data_type FROM all_tab_columns "
+                    "WHERE owner = :owner AND table_name = :table_name"
+                ),
+                {"owner": owner, "table_name": table_name.upper()},
+            ).fetchall()
+    except Exception:
+        return columns
+    real_types = {str(row[0]).upper(): str(row[1]).upper() for row in rows}
+    for col in columns:
+        real = real_types.get(str(col["name"]).upper())
+        if real == "LONG RAW" and col["type"].__class__.__name__.upper() in {"NULLTYPE", "TEXT"}:
+            col["type"] = LargeBinary()
+    return columns
+
+
+def build_target_table(source_engine: Engine, target_engine: Engine, source_schema: str | None, target_schema: str | None, table_name: str) -> tuple[Table, list[str]]:
+    inspector = inspect(source_engine)
+    columns = inspector.get_columns(table_name, schema=source_schema)
+    if not columns:
+        raise RuntimeError(f"源表不存在或无列：{table_name}")
+    if source_engine.dialect.name == "oracle":
+        columns = _resolve_oracle_column_types(source_engine, source_schema, table_name, columns)
+    try:
+        primary_keys = set(inspector.get_pk_constraint(table_name, schema=source_schema).get("constrained_columns") or [])
+    except Exception:
+        # Views do not expose primary-key metadata on every driver.
+        primary_keys = set()
+    metadata = MetaData()
+    target_columns = []
+    for column in columns:
+        primary_key = column["name"] in primary_keys
+        identity_info = column.get("identity") or {}
+        is_identity = bool(identity_info) or column.get("autoincrement") is True
+        column_args: list[Any] = [column["name"], portable_type(column["type"], target_engine.dialect.name, is_identity)]
+        if is_identity and target_engine.dialect.name in {"oracle", "postgresql"}:
+            column_args.append(Identity(start=identity_info.get("start"), increment=identity_info.get("increment"), always=False))
+        target_columns.append(Column(*column_args, nullable=column.get("nullable", True), primary_key=primary_key, autoincrement=is_identity if primary_key else "auto"))
+    if not primary_keys and target_engine.dialect.name == "mysql":
+        # TDSQL/MySQL commonly enforces sql_require_primary_key. Give a source
+        # view or heap table an internal target key without changing its data.
+        target_columns.insert(0, Column("__flowdb_row_id", BigInteger(), primary_key=True, autoincrement=True))
+    return Table(table_name, metadata, *target_columns, schema=target_schema), [column["name"] for column in columns]
+
+
+def estimate_row_size(row: Iterable[Any]) -> int:
+    total = 0
+    for value in row:
+        if value is None:
+            continue
+        if isinstance(value, bytes):
+            total += len(value)
+        elif isinstance(value, (str, Decimal)):
+            total += len(str(value).encode("utf-8"))
+        else:
+            total += 8
+    return total
+
+
+@dataclass
+class PreparedTable:
+    source: Table
+    target: Table
+    column_names: list[str]
+
+
+def prepare_table(source_engine: Engine, target_engine: Engine, source_schema: str | None, target_schema: str | None, name: str, mode: str, create_tables: bool) -> PreparedTable:
+    target_table, column_names = build_target_table(source_engine, target_engine, source_schema, target_schema, name)
+    source_table = Table(name, MetaData(), autoload_with=source_engine, schema=source_schema)
+    exists = inspect(target_engine).has_table(name, schema=target_schema)
+    quoted = target_engine.dialect.identifier_preparer
+    qualified = f"{quoted.quote_schema(target_schema)}.{quoted.quote(name)}" if target_schema else quoted.quote(name)
+    if exists and mode == "fail":
+        raise RuntimeError(f"目标表已存在：{name}")
+    if exists and mode == "drop_and_create":
+        target_table.drop(target_engine, checkfirst=True)
+        exists = False
+    if exists and mode == "truncate":
+        with target_engine.begin() as connection:
+            connection.execute(text(f"TRUNCATE TABLE {qualified}"))
+    if not exists:
+        if not create_tables:
+            raise RuntimeError(f"目标表不存在：{name}")
+        target_table.create(target_engine)
+    return PreparedTable(source_table, target_table, column_names)
+
+
+def selectable_columns(source_engine: Engine, target_engine: Engine, source_table: Table):
+    selected_columns = []
+    for column in source_table.columns:
+        source_type_name = column.type.__class__.__name__.upper()
+        if (
+            source_engine.dialect.name == "oracle"
+            and target_engine.dialect.name == "mysql"
+            and "TIMESTAMP" in source_type_name
+            and bool(getattr(column.type, "timezone", False))
+        ):
+            selected_columns.append(func.to_char(column, "YYYY-MM-DD HH24:MI:SS.FF9 TZH:TZM").label(column.name))
+        elif "BFILE" in source_type_name or "BFILE" in str(column.type).upper():
+            # BFILE 是外部文件引用（DIRECTORY + 文件名），数据不在库内；读取 LOB
+            # 会触发源端 FILEOPEN 打开外部 OS 文件，文件缺失即报 ORA-22288。
+            # 迁移时该列置 NULL，外部文件内容不随库迁移。
+            selected_columns.append(null().label(column.name))
+        else:
+            selected_columns.append(column)
+    return selected_columns
+
+
+def copy_batches(source_engine: Engine, target_engine: Engine, prepared: PreparedTable, batch_size: int):
+    selected_columns = selectable_columns(source_engine, target_engine, prepared.source)
+    with source_engine.connect().execution_options(stream_results=True) as source_connection:
+        result = source_connection.execute(select(*selected_columns)).mappings()
+        while True:
+            rows = result.fetchmany(batch_size)
+            if not rows:
+                break
+            target_types = {column.name: column.type for column in prepared.target.columns}
+            payload = [
+                {name: adapt_value(row[name], target_types[name]) for name in prepared.column_names}
+                for row in rows
+            ]
+            with target_engine.begin() as target_connection:
+                target_connection.execute(prepared.target.insert(), payload)
+            yield len(payload), sum(estimate_row_size(row.values()) for row in payload)
+
+
+def adapt_value(value: Any, target_type: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(target_type, String) and isinstance(value, datetime):
+        return value.isoformat(sep=" ")
+    if isinstance(target_type, String) and isinstance(value, timedelta):
+        # Oracle INTERVAL DAY TO SECOND arrives as timedelta. Stringify with
+        # the canonical Python form so validation compares equal.
+        return str(value)
+    if hasattr(value, "read"):
+        return value.read()
+    return value
